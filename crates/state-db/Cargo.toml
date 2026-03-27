@@ -1,0 +1,17 @@
+[package]
+name = "state-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RocksDB-backed flat KV state with LtHash state commitment"
+
+[dependencies]
+lthash.workspace = true
+alloy-primitives.workspace = true
+rocksdb.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

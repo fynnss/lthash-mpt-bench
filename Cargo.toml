@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "crates/lthash",
+    "crates/state-db",
+    "crates/bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# internal
+lthash = { path = "crates/lthash" }
+state-db = { path = "crates/state-db" }
+
+# ethereum primitives
+alloy-primitives = { version = "1", default-features = false, features = ["std"] }
+alloy-trie = { version = "0.9", default-features = false, features = ["std"] }
+alloy-rlp = { version = "0.3", default-features = false, features = ["arrayvec"] }
+
+# hashing
+blake3 = "1"
+
+# storage
+rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
+
+# parallelism
+rayon = "1"
+
+# benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# misc
+rand = "0.8"
+thiserror = "1"
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

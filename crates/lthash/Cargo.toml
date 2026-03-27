@@ -1,0 +1,12 @@
+[package]
+name = "lthash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lattice Hash (LtHash) state commitment — BLAKE3 XOF based, O(1) updates, quantum-safe"
+
+[dependencies]
+blake3.workspace = true
+rayon.workspace = true
+alloy-primitives.workspace = true

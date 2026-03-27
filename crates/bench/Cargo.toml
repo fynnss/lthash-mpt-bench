@@ -1,0 +1,31 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Benchmarks: LtHash vs MPT state root computation"
+
+[[bench]]
+name = "state_root"
+harness = false
+
+[[bench]]
+name = "rw_block"
+harness = false
+
+[dependencies]
+lthash.workspace = true
+state-db.workspace = true
+alloy-primitives.workspace = true
+alloy-trie.workspace = true
+alloy-rlp.workspace = true
+criterion.workspace = true
+rayon.workspace = true
+rand.workspace = true
+rocksdb.workspace = true
+eth_trie = "0.6"
+
+tempfile = "3"
+
+[dev-dependencies]
