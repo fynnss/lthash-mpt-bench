@@ -3,11 +3,17 @@
 //! Both sides use RocksDB. Accounts only, no storage. Base state: 1M accounts.
 //! All latency figures are **per-block**.
 //!
-//! lthash_rdb   — parallel BLAKE3 delta + single atomic WriteBatch (N flat puts)
-//! mpt_par_rdb  — 16-way parallel EthTrie<RocksDB> subtries (bucketed by nibble),
-//!                parallel inserts + root_hash via rayon, 16 writes to shared RocksDB
+//! Three-phase breakdown (printed to stdout before Criterion runs):
 //!
-//! Phase breakdown (hash vs commit) is printed to stdout before Criterion runs.
+//! lthash_rdb:
+//!   hash  — parallel BLAKE3 XOF delta computation
+//!   build — encode accounts + assemble WriteBatch in memory
+//!   write — db.write(batch): RocksDB WAL / memtable
+//!
+//! mpt_par_rdb (16-way parallel EthTrie):
+//!   insert — par trie.insert() calls: in-memory node traversal
+//!   root   — par root_hash(): keccak path recompute, dirty nodes buffered (no DB write yet)
+//!   write  — flush all 16 pending WriteBatches to RocksDB
 
 use alloy_primitives::{keccak256, B256, U256};
 use alloy_rlp::Encodable;
@@ -20,13 +26,12 @@ use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use state_db::StateDb;
 use std::{
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
 const BASE: usize = 1_000_000;
-/// Number of rounds used for the per-phase breakdown printout.
 const PHASE_ROUNDS: usize = 5;
 
 // ── MPT account encoding ──────────────────────────────────────────────────────
@@ -65,50 +70,73 @@ fn assemble_branch_root(children: &[Option<B256>; 16]) -> B256 {
     keccak256(&buf)
 }
 
-// ── RocksDB backend for EthTrie ───────────────────────────────────────────────
+// ── RocksDB backend for EthTrie — with write buffering ───────────────────────
+//
+// All writes (insert / insert_batch) are collected in `pending` instead of
+// going to RocksDB immediately.  Call `flush_pending()` to write the batch.
+// This lets us time the root-hash phase (keccak recompute) independently from
+// the actual RocksDB write phase.
+//
+// Reads (get) always go to RocksDB.  EthTrie keeps a node cache so in practice
+// reads after the first block rarely hit the DB.
 
 struct PrefixedRocksDb {
     db: Arc<DB>,
     cf_name: &'static str,
     prefix: Vec<u8>,
+    pending: Mutex<WriteBatch>,
 }
 
 impl PrefixedRocksDb {
+    fn new(db: Arc<DB>, cf_name: &'static str, prefix: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self { db, cf_name, prefix, pending: Mutex::new(WriteBatch::default()) })
+    }
+
     fn prefixed(&self, key: &[u8]) -> Vec<u8> {
         let mut k = Vec::with_capacity(self.prefix.len() + key.len());
         k.extend_from_slice(&self.prefix);
         k.extend_from_slice(key);
         k
     }
+
     fn cf(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(self.cf_name).unwrap()
+    }
+
+    /// Write all buffered operations to RocksDB and clear the buffer.
+    fn flush_pending(&self) -> Result<(), rocksdb::Error> {
+        let batch = std::mem::take(&mut *self.pending.lock().unwrap());
+        self.db.write(batch)
     }
 }
 
 impl TrieDB for PrefixedRocksDb {
     type Error = rocksdb::Error;
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         self.db.get_cf(self.cf(), self.prefixed(key))
     }
     fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
-        self.db.put_cf(self.cf(), self.prefixed(key), value)
+        self.pending.lock().unwrap().put_cf(self.cf(), self.prefixed(key), value);
+        Ok(())
     }
     fn insert_batch(&self, keys: Vec<Vec<u8>>, values: Vec<Vec<u8>>) -> Result<(), Self::Error> {
-        let mut batch = WriteBatch::default();
+        let mut batch = self.pending.lock().unwrap();
         for (k, v) in keys.into_iter().zip(values) {
             batch.put_cf(self.cf(), self.prefixed(&k), v);
         }
-        self.db.write(batch)
+        Ok(())
     }
     fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        self.db.delete_cf(self.cf(), self.prefixed(key))
+        self.pending.lock().unwrap().delete_cf(self.cf(), self.prefixed(key));
+        Ok(())
     }
     fn remove_batch(&self, keys: &[Vec<u8>]) -> Result<(), Self::Error> {
-        let mut batch = WriteBatch::default();
+        let mut batch = self.pending.lock().unwrap();
         for k in keys {
             batch.delete_cf(self.cf(), self.prefixed(k));
         }
-        self.db.write(batch)
+        Ok(())
     }
     fn flush(&self) -> Result<(), Self::Error> {
         Ok(())
@@ -129,31 +157,22 @@ fn open_mpt_db<P: AsRef<Path>>(path: P) -> Arc<DB> {
 }
 
 // ── 16-way parallel MPT backed by RocksDB ────────────────────────────────────
-//
-// 16 independent EthTrie instances, one per first nibble of keccak256(addr).
-// Each holds a PrefixedRocksDb with a 1-byte nibble prefix so all 16 share
-// one RocksDB env without key collisions.
-//
-// apply_block phases:
-//   Phase 1 "insert"      — par_iter_mut: N trie.insert() calls (in-memory node updates)
-//   Phase 2 "root+commit" — par_iter_mut: trie.root_hash() per subtrie
-//                           (keccak256 path recompute + insert_batch to RocksDB)
 
 struct ParMptRdbState {
     subtries: Vec<EthTrie<PrefixedRocksDb>>,
+    backends: Vec<Arc<PrefixedRocksDb>>,
 }
 
 impl ParMptRdbState {
     fn from_base(base: &[bench::Account], db: Arc<DB>) -> Self {
-        let mut subtries: Vec<EthTrie<PrefixedRocksDb>> = (0..16u8)
-            .map(|i| {
-                EthTrie::new(Arc::new(PrefixedRocksDb {
-                    db: Arc::clone(&db),
-                    cf_name: CF_MPT,
-                    prefix: vec![i],
-                }))
-            })
-            .collect();
+        let mut backends = Vec::with_capacity(16);
+        let mut subtries = Vec::with_capacity(16);
+
+        for i in 0u8..16 {
+            let backend = PrefixedRocksDb::new(Arc::clone(&db), CF_MPT, vec![i]);
+            subtries.push(EthTrie::new(Arc::clone(&backend)));
+            backends.push(backend);
+        }
 
         for (idx, a) in base.iter().enumerate() {
             let hashed = keccak256(a.addr);
@@ -165,28 +184,33 @@ impl ParMptRdbState {
                 println!("  mpt_par_rdb setup: {}/{BASE}", idx + 1);
             }
         }
-        // Materialise all 16 roots (writes initial trie nodes to RocksDB)
-        for t in &mut subtries {
-            t.root_hash().unwrap();
+
+        // Materialise roots and flush initial trie nodes to RocksDB
+        for (trie, backend) in subtries.iter_mut().zip(backends.iter()) {
+            trie.root_hash().unwrap();
+            backend.flush_pending().unwrap();
         }
-        Self { subtries }
+
+        Self { subtries, backends }
     }
 
-    /// Apply pre-bucketed block changes; returns state root.
+    /// Apply block (all 3 phases). Used by Criterion for total latency.
     fn apply_block(&mut self, buckets: &[Vec<([u8; 32], Vec<u8>)>; 16]) -> B256 {
-        let (_, _, root) = self.apply_block_timed(buckets);
+        let (_, _, _, root) = self.apply_block_timed(buckets);
         root
     }
 
-    /// Apply pre-bucketed changes and return `(insert_dur, root_commit_dur, root)`.
+    /// Apply block with per-phase timing.
+    /// Returns `(insert_dur, root_dur, write_dur, state_root)`.
     ///
-    /// * `insert_dur`      — parallel trie.insert() calls (in-memory only)
-    /// * `root_commit_dur` — parallel root_hash() = keccak path recompute + RocksDB writes
+    /// * `insert_dur` — par trie.insert(): in-memory node traversal only
+    /// * `root_dur`   — par root_hash(): keccak path recompute, writes buffered
+    /// * `write_dur`  — flush 16 pending batches to RocksDB
     fn apply_block_timed(
         &mut self,
         buckets: &[Vec<([u8; 32], Vec<u8>)>; 16],
-    ) -> (Duration, Duration, B256) {
-        // Phase 1: parallel inserts (pure in-memory trie node traversal)
+    ) -> (Duration, Duration, Duration, B256) {
+        // Phase 1: parallel trie.insert (pure in-memory)
         let t0 = Instant::now();
         self.subtries.par_iter_mut().zip(buckets.par_iter()).for_each(|(trie, bucket)| {
             for (k, v) in bucket {
@@ -195,7 +219,7 @@ impl ParMptRdbState {
         });
         let insert_dur = t0.elapsed();
 
-        // Phase 2: parallel root_hash — rehashes dirty paths + writes nodes to RocksDB
+        // Phase 2: parallel root_hash — keccak recompute, dirty nodes buffered
         let t1 = Instant::now();
         let children: [Option<B256>; 16] = self
             .subtries
@@ -205,9 +229,16 @@ impl ParMptRdbState {
             .try_into()
             .unwrap();
         let root = assemble_branch_root(&children);
-        let commit_dur = t1.elapsed();
+        let root_dur = t1.elapsed();
 
-        (insert_dur, commit_dur, root)
+        // Phase 3: flush all 16 pending batches to RocksDB
+        let t2 = Instant::now();
+        for backend in &self.backends {
+            backend.flush_pending().unwrap();
+        }
+        let write_dur = t2.elapsed();
+
+        (insert_dur, root_dur, write_dur, root)
     }
 }
 
@@ -239,14 +270,11 @@ fn fmt_tps(n: usize, d: Duration) -> String {
     let per_sec = n as f64 / d.as_secs_f64();
     if per_sec >= 1_000_000.0 {
         format!("{:.2}M/s", per_sec / 1_000_000.0)
-    } else if per_sec >= 1_000.0 {
-        format!("{:.0}k/s", per_sec / 1_000.0)
     } else {
-        format!("{:.0}/s", per_sec)
+        format!("{:.0}k/s", per_sec / 1_000.0)
     }
 }
 
-/// Run `PHASE_ROUNDS` blocks for each scenario and print a breakdown table.
 fn print_phase_breakdown(
     scenarios: &[(&str, usize)],
     lthash_db: &mut StateDb,
@@ -255,59 +283,62 @@ fn print_phase_breakdown(
     mpt_buckets_map: &[[Vec<([u8; 32], Vec<u8>)>; 16]],
 ) {
     println!(
-        "\n╔══ RocksDB Phase Breakdown — avg over {PHASE_ROUNDS} blocks ══════════════════════════════════════════╗"
+        "\n╔══ RocksDB Phase Breakdown — avg over {PHASE_ROUNDS} blocks ══════════════════════════════════════════════════════╗"
     );
     println!(
-        "║ {:<6}  {:<42}  {:<44} ║",
-        "block", "lthash_rdb", "mpt_par_rdb"
+        "║  {:<6}  {:<10} {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
+        "block",
+        "lt:hash", "lt:build", "lt:write", "lt:total", "lt:TPS",
+        "mpt:insert", "mpt:root", "mpt:write", "mpt:total", "mpt:TPS",
     );
     println!(
-        "║ {:<6}  {:<12} {:<12} {:<12} {:>3}  {:<12} {:<14} {:<12} {:>3} ║",
-        "", "hash", "commit", "total", "TPS", "insert", "root+commit", "total", "TPS"
+        "╠══════════════════════════════════════════════════════════════════════════════════════════════════════════╣"
     );
-    println!("╠══════════════════════════════════════════════════════════════════════════════════════════════╣");
 
     for (idx, &(label, n)) in scenarios.iter().enumerate() {
         let lthash_changes = &lthash_changes_map[idx];
         let buckets = &mpt_buckets_map[idx];
 
         let mut lh_hash = Duration::ZERO;
-        let mut lh_commit = Duration::ZERO;
+        let mut lh_build = Duration::ZERO;
+        let mut lh_write = Duration::ZERO;
         let mut mpt_insert = Duration::ZERO;
-        let mut mpt_root_commit = Duration::ZERO;
+        let mut mpt_root = Duration::ZERO;
+        let mut mpt_write = Duration::ZERO;
 
         for _ in 0..PHASE_ROUNDS {
-            let (h, c) = lthash_db.apply_parallel_timed(lthash_changes).unwrap();
+            let (h, b, w) = lthash_db.apply_parallel_timed(lthash_changes).unwrap();
             lh_hash += h;
-            lh_commit += c;
+            lh_build += b;
+            lh_write += w;
 
-            let (i, rc, _) = mpt_state.apply_block_timed(buckets);
+            let (i, r, w2, _) = mpt_state.apply_block_timed(buckets);
             mpt_insert += i;
-            mpt_root_commit += rc;
+            mpt_root += r;
+            mpt_write += w2;
         }
 
         let r = PHASE_ROUNDS as u32;
         let lh_h = lh_hash / r;
-        let lh_c = lh_commit / r;
-        let lh_tot = lh_h + lh_c;
+        let lh_b = lh_build / r;
+        let lh_w = lh_write / r;
+        let lh_tot = lh_h + lh_b + lh_w;
         let mpt_i = mpt_insert / r;
-        let mpt_rc = mpt_root_commit / r;
-        let mpt_tot = mpt_i + mpt_rc;
+        let mpt_r = mpt_root / r;
+        let mpt_w = mpt_write / r;
+        let mpt_tot = mpt_i + mpt_r + mpt_w;
 
         println!(
-            "║ {:<6}  {:<12} {:<12} {:<12} {:>6}  {:<12} {:<14} {:<12} {:>6} ║",
+            "║  {:<6}  {:<10} {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
             label,
-            fmt_dur(lh_h),
-            fmt_dur(lh_c),
-            fmt_dur(lh_tot),
-            fmt_tps(n, lh_tot),
-            fmt_dur(mpt_i),
-            fmt_dur(mpt_rc),
-            fmt_dur(mpt_tot),
-            fmt_tps(n, mpt_tot),
+            fmt_dur(lh_h), fmt_dur(lh_b), fmt_dur(lh_w), fmt_dur(lh_tot), fmt_tps(n, lh_tot),
+            fmt_dur(mpt_i), fmt_dur(mpt_r), fmt_dur(mpt_w), fmt_dur(mpt_tot), fmt_tps(n, mpt_tot),
         );
     }
-    println!("╚══════════════════════════════════════════════════════════════════════════════════════════════╝\n");
+
+    println!(
+        "╚══════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n"
+    );
 }
 
 // ── Benchmark fixture ─────────────────────────────────────────────────────────
@@ -351,7 +382,6 @@ fn bench_rw(c: &mut Criterion) {
 
     let scenarios: &[(&str, usize)] = &[("1k", 1_000), ("10k", 10_000), ("100k", 100_000)];
 
-    // Pre-compute changes + buckets for all scenarios
     let blocks: Vec<_> = scenarios.iter().map(|&(_, n)| gen_block(&fix.base, n)).collect();
 
     let lthash_changes_map: Vec<Vec<StateChange>> = blocks
@@ -375,7 +405,7 @@ fn bench_rw(c: &mut Criterion) {
         })
         .collect();
 
-    // ── Phase breakdown table (printed before Criterion measurements) ─────────
+    // ── Phase breakdown (printed before Criterion) ────────────────────────────
     print_phase_breakdown(
         scenarios,
         &mut fix.lthash_db,

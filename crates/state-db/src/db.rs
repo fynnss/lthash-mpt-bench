@@ -90,27 +90,42 @@ impl StateDb {
         Ok(())
     }
 
-    /// Like [`apply_parallel`] but returns `(hash_duration, commit_duration)`.
+    /// Like [`apply_parallel`] but returns `(hash_dur, build_dur, write_dur)`.
     ///
-    /// `hash_duration`  — time for parallel BLAKE3 XOF delta computation.
-    /// `commit_duration` — time for the atomic RocksDB `WriteBatch` write.
+    /// * `hash_dur`  — parallel BLAKE3 XOF delta computation
+    /// * `build_dur` — encode accounts + assemble `WriteBatch` in memory
+    /// * `write_dur` — `db.write(batch)` — actual RocksDB WAL / memtable write
     pub fn apply_parallel_timed(
         &mut self,
         changes: &[StateChange],
-    ) -> Result<(std::time::Duration, std::time::Duration)> {
-        let t0 = std::time::Instant::now();
+    ) -> Result<(std::time::Duration, std::time::Duration, std::time::Duration)> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
         apply_parallel(&mut self.world_hash, changes);
         let hash_dur = t0.elapsed();
 
-        let t1 = std::time::Instant::now();
-        self.flush_changes(changes)?;
-        let commit_dur = t1.elapsed();
+        let t1 = Instant::now();
+        let batch = self.build_batch(changes);
+        let build_dur = t1.elapsed();
 
-        Ok((hash_dur, commit_dur))
+        let t2 = Instant::now();
+        self.db.write(batch)?;
+        let write_dur = t2.elapsed();
+
+        Ok((hash_dur, build_dur, write_dur))
     }
 
     /// Write all KV changes + updated world hash to RocksDB in one batch.
     fn flush_changes(&self, changes: &[StateChange]) -> Result<()> {
+        let batch = self.build_batch(changes);
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Encode all KV changes + world hash into a `WriteBatch` without writing.
+    /// Pure in-memory: serialize account bytes and fill batch buffers.
+    fn build_batch(&self, changes: &[StateChange]) -> WriteBatch {
         let cf_accounts = self.db.cf_handle(CF_ACCOUNTS).unwrap();
         let cf_storages = self.db.cf_handle(CF_STORAGES).unwrap();
         let cf_meta = self.db.cf_handle(CF_META).unwrap();
@@ -120,9 +135,7 @@ impl StateDb {
         for change in changes {
             match change {
                 StateChange::Account { addr, new, .. } => {
-                    let key = addr.as_slice();
-                    let value = encode_account(new);
-                    batch.put_cf(&cf_accounts, key, value);
+                    batch.put_cf(&cf_accounts, addr.as_slice(), encode_account(new));
                 }
                 StateChange::DeleteAccount { addr, .. } => {
                     batch.delete_cf(&cf_accounts, addr.as_slice());
@@ -138,11 +151,8 @@ impl StateDb {
             }
         }
 
-        // Persist the updated world hash
         batch.put_cf(&cf_meta, META_WORLD_HASH, self.world_hash.to_bytes());
-
-        self.db.write(batch)?;
-        Ok(())
+        batch
     }
 
     // ── Read API ─────────────────────────────────────────────────────────────

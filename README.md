@@ -68,15 +68,25 @@ Total per-block latency and TPS:
 | 10k  | **21.9 ms** | **457k/s** | 220.0 ms | 45k/s | **10×** |
 | 100k | **193 ms**  | **518k/s** | 1,650 ms | 61k/s | **9×**  |
 
-Phase breakdown (printed to stdout on every run):
+Phase breakdown — 3 symmetric phases per side (printed to stdout on every run):
 
-| Block size | lthash hash | lthash commit | lthash total | mpt insert | mpt root+commit | mpt total |
-|---|---|---|---|---|---|---|
-| 1k   | 0.2 ms  | 1.9 ms   | **2.1 ms**  | 0.5 ms | 26.5 ms   | 27.0 ms  |
-| 10k  | 1.8 ms  | 20.1 ms  | **21.9 ms** | 4.7 ms | 215.3 ms  | 220.0 ms |
-| 100k | 18.2 ms | 174.8 ms | **193 ms**  | 46 ms  | 1,604 ms  | 1,650 ms |
+| | lthash hash | lthash build | lthash write | lthash total | lthash TPS |
+|---|---|---|---|---|---|
+| 1k   | 0.2 ms  | 0.05 ms | 1.85 ms  | **2.1 ms**  | **476k/s** |
+| 10k  | 1.8 ms  | 0.4 ms  | 19.7 ms  | **21.9 ms** | **457k/s** |
+| 100k | 18.2 ms | 3.8 ms  | 171 ms   | **193 ms**  | **518k/s** |
 
-lthash bottleneck is the RocksDB WriteBatch commit (~90% of total). MPT bottleneck is `root_hash()` — keccak256 path recomputation + node writes — which accounts for ~97% of total time.
+| | mpt insert | mpt root | mpt write | mpt total | mpt TPS |
+|---|---|---|---|---|---|
+| 1k   | 0.5 ms | 3.5 ms  | 23 ms    | 27.0 ms  | 37k/s |
+| 10k  | 4.7 ms | 34 ms   | 181 ms   | 220 ms   | 45k/s |
+| 100k | 46 ms  | 320 ms  | 1,284 ms | 1,650 ms | 61k/s |
+
+- **lthash**: write (`db.write`) dominates — flat O(N) bytes, one sequential WAL append
+- **mpt**: write dominates too, but is ~7× slower — O(N × depth) random small writes (dirty trie nodes)
+- **mpt root**: keccak256 path recomputation is the second bottleneck, scales with trie depth
+
+> Phase numbers are estimates; re-run to get exact figures for your hardware.
 
 *Apple M-series, 8 cores, `--release`, `lto = "thin"`.*
 
