@@ -242,28 +242,11 @@ fn bench_block_commit(c: &mut Criterion) {
         let total_changes = n_acc + n_slots; // accounts + storage slots touched
         group.throughput(Throughput::Elements(total_changes as u64));
 
-        // ── LtHash incremental ───────────────────────────────────────────────
-        // Starts from pre-built base_world, applies only the delta for this block.
-        // O(n_acc + n_slots) BLAKE3 XOF operations, no state-size dependency.
+        // O(n_acc + n_slots) BLAKE3 XOF operations, parallel via rayon.
+        // No state-size dependency — cost depends only on changed entries.
         let lthash_changes: Vec<StateChange> =
             block.iter().flat_map(|c| c.to_lthash_changes()).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("lthash_seq", label),
-            &lthash_changes,
-            |b, changes| {
-                b.iter(|| {
-                    let mut world = base_world.clone();
-                    apply_sequential(&mut world, changes);
-                    world.state_root()
-                });
-            },
-        );
-
-        // ── LtHash parallel ──────────────────────────────────────────────────
-        // rayon splits the changes across threads, each thread computes a
-        // partial WorldHash delta, then they are reduced (wrapping-add) with
-        // no locks.  Addition is commutative so order doesn't matter.
         group.bench_with_input(
             BenchmarkId::new("lthash_par", label),
             &lthash_changes,
