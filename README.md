@@ -128,30 +128,32 @@ Models the **async-write path**: execution results are buffered in memory, DB wr
 cargo bench --bench state_root
 ```
 
-Three competitors operate entirely in memory:
-- **`lthash_par`**: rayon parallel BLAKE3 XOF per entry + wrapping-add reduce
-- **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB` — real incremental in-memory MPT (not a full rebuild); represents the **lower bound** for MPT since there is zero DB IO
-- **`mpt_par`**: 16-way parallel MPT using alloy-trie `HashBuilder`:
+Three competitors operate entirely in memory, each applied **incrementally** to a pre-built state (no rebuild per block):
+- **`lthash_par`**: clone 2048-byte world hash + rayon parallel BLAKE3 XOF per entry + wrapping-add reduce
+- **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB`, kept in memory across blocks — incremental O(n × depth) keccak256 per changed entry
+- **`mpt_par`**: 16-way parallel MPT using alloy-trie `HashBuilder`, kept in memory across blocks:
   1. Storage roots: rayon `par_iter` over N changed accounts (each independent)
   2. Account trie: split by first nibble of `keccak256(addr)` → 16 independent subtries computed in parallel, assembled into root branch node via RLP + keccak256
 
-| Scenario | lthash_par | mpt_par | MPT (serial) | vs mpt_par | vs mpt |
-|---|---|---|---|---|---|
-| conservative 25k | **19 ms** | 54 ms | 271 ms | 2.8× | 14× |
-| typical 50k | **36 ms** | 115 ms | 576 ms | 3.2× | 16× |
-| heavy 100k | **77 ms** | 230 ms | 1,126 ms | 3.0× | 15× |
+| Scenario | lthash_par | mpt_par | mpt (serial) | mpt_par vs mpt |
+|---|---|---|---|---|
+| conservative 25k | 40 ms | **14 ms** | 122 ms | 8.7× |
+| typical 50k | 40 ms | **33 ms** | 247 ms | 7.5× |
+| heavy 100k | 78 ms | **58 ms** | 516 ms | 8.9× |
 
 Assuming 1s block time and the given scenario represents ~10k TPS:
 
-| Scenario | lthash_par | mpt_par | MPT (serial) |
+| Scenario | lthash_par | mpt_par | mpt (serial) |
 |---|---|---|---|
-| conservative 25k | **515k TPS** | 185k TPS | 37k TPS |
-| typical 50k | **275k TPS** | 87k TPS | 17k TPS |
-| heavy 100k | **130k TPS** | 43k TPS | 8.9k TPS ❌ |
+| conservative 25k | 250k TPS | **714k TPS** | 82k TPS |
+| typical 50k | 250k TPS | **303k TPS** | 40k TPS |
+| heavy 100k | 128k TPS | **172k TPS** | 19k TPS |
 
-> Max TPS capacity if state-root computation is the sole bottleneck. MPT (serial) cannot sustain 10k TPS under a heavy DeFi workload with 1s blocks.
+> Max TPS capacity if state-root computation is the sole bottleneck.
 
-`lthash_par` sustains **~1.3M state changes/s**. `mpt_par` reaches ~435k/s by parallelising storage root computation and the 16 independent subtries. Serial MPT is capped at ~87k/s due to O(depth) keccak256 operations per changed entry.
+**Key insight**: in pure in-memory computation, `mpt_par` is faster than `lthash_par` because LtHash generates **2048 bytes of XOF output per entry** (25k entries × 2048B = 50 MB of BLAKE3 output), while `mpt_par`'s HashBuilder processes far less data per entry. Serial MPT is 7–9× slower than `mpt_par` due to O(depth) keccak256 traversal that cannot be parallelised.
+
+LtHash's real advantage emerges in the **full RW pipeline** (Benchmark 2) where flat KV access patterns (1 DB read + 1 write per entry) vs MPT's O(depth) random trie node reads dominate the runtime.
 
 ### Benchmark 2 — Full pipeline with RocksDB (both sides)
 

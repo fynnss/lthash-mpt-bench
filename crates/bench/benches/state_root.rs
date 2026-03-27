@@ -397,36 +397,26 @@ fn bench_block_commit(c: &mut Criterion) {
         );
 
         // ── MPT incremental ──────────────────────────────────────────────────
-        // Starts from pre-built EthTrie, calls insert() for each changed
-        // account/slot, then root_hash(). EthTrie caches unchanged nodes —
-        // only the modified paths are rehashed (O(n_changed × depth)).
-        group.bench_with_input(
-            BenchmarkId::new("mpt", label),
-            &block,
-            |b, changes| {
-                b.iter(|| {
-                    // Clone the trie state for each iteration so we always
-                    // benchmark a single block's delta from the same base.
-                    let mut mpt = MptState::from_base(&base.accounts[..n_acc]);
-                    mpt.apply_block(changes)
-                });
-            },
-        );
+        // Build the trie ONCE and keep it alive across all iterations.
+        // Each iter applies the same block delta on top of the previous state —
+        // same number of nodes touched per block, same depth, representative timing.
+        {
+            let mut mpt = MptState::from_base(&base.accounts[..n_acc]);
+            let changes = block.clone();
+            group.bench_function(BenchmarkId::new("mpt", label), move |b| {
+                b.iter(|| mpt.apply_block(&changes));
+            });
+        }
 
         // ── mpt_par ──────────────────────────────────────────────────────────
-        // 16-way parallel: storage roots computed in parallel per account,
-        // then 16 subtrie roots (split by first nibble) computed in parallel,
-        // assembled into root branch node via RLP + keccak256.
-        group.bench_with_input(
-            BenchmarkId::new("mpt_par", label),
-            &block,
-            |b, changes| {
-                b.iter(|| {
-                    let mut state = ParMptState::from_base(&base.accounts[..n_acc]);
-                    state.apply_block(changes)
-                });
-            },
-        );
+        // Same: one ParMptState kept in memory, block applied each iteration.
+        {
+            let mut state = ParMptState::from_base(&base.accounts[..n_acc]);
+            let changes = block.clone();
+            group.bench_function(BenchmarkId::new("mpt_par", label), move |b| {
+                b.iter(|| state.apply_block(&changes));
+            });
+        }
     }
 
     group.finish();
