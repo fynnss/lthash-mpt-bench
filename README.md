@@ -128,17 +128,30 @@ Models the **async-write path**: execution results are buffered in memory, DB wr
 cargo bench --bench state_root
 ```
 
-Both competitors operate entirely in memory:
+Three competitors operate entirely in memory:
 - **`lthash_par`**: rayon parallel BLAKE3 XOF per entry + wrapping-add reduce
 - **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB` — real incremental in-memory MPT (not a full rebuild); represents the **lower bound** for MPT since there is zero DB IO
+- **`mpt_par`**: 16-way parallel MPT using alloy-trie `HashBuilder`:
+  1. Storage roots: rayon `par_iter` over N changed accounts (each independent)
+  2. Account trie: split by first nibble of `keccak256(addr)` → 16 independent subtries computed in parallel, assembled into root branch node via RLP + keccak256
 
-| Scenario | lthash_par | MPT (in-memory) | Speedup |
+| Scenario | lthash_par | mpt_par | MPT (serial) | vs mpt_par | vs mpt |
+|---|---|---|---|---|---|
+| conservative 25k | **19 ms** | 54 ms | 271 ms | 2.8× | 14× |
+| typical 50k | **36 ms** | 115 ms | 576 ms | 3.2× | 16× |
+| heavy 100k | **77 ms** | 230 ms | 1,126 ms | 3.0× | 15× |
+
+Assuming 1s block time and the given scenario represents ~10k TPS:
+
+| Scenario | lthash_par | mpt_par | MPT (serial) |
 |---|---|---|---|
-| conservative 25k | **23 ms** | 276 ms | 12× |
-| typical 50k | **37 ms** | 589 ms | 16× |
-| heavy 100k | **104 ms** | 1,143 ms | 11× |
+| conservative 25k | **515k TPS** | 185k TPS | 37k TPS |
+| typical 50k | **275k TPS** | 87k TPS | 17k TPS |
+| heavy 100k | **130k TPS** | 43k TPS | 8.9k TPS ❌ |
 
-Throughput: `lthash_par` sustains **~1–1.3M state changes/s**. MPT sustains ~87k/s due to O(depth) keccak256 operations per changed entry, which cannot be parallelised.
+> Max TPS capacity if state-root computation is the sole bottleneck. MPT (serial) cannot sustain 10k TPS under a heavy DeFi workload with 1s blocks.
+
+`lthash_par` sustains **~1.3M state changes/s**. `mpt_par` reaches ~435k/s by parallelising storage root computation and the 16 independent subtries. Serial MPT is capped at ~87k/s due to O(depth) keccak256 operations per changed entry.
 
 ### Benchmark 2 — Full pipeline with RocksDB (both sides)
 

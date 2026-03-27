@@ -1,25 +1,26 @@
-//! Benchmark: LtHash vs MPT incremental state root update.
+//! Benchmark: LtHash vs MPT (serial + 16-way parallel) incremental state root update.
 //!
-//! Simulates one block commit: a large base state exists,
-//! and a block touches N accounts (update nonce/balance) and M storage slots.
+//! Simulates one block commit against a 100k-account base state.
 //!
-//! Both schemes maintain persistent state across iterations:
-//! - LtHash: WorldHash (2 KB in memory) + apply delta
-//! - MPT:    EthTrie<MemoryDB> (full in-memory trie) + incremental insert + root_hash()
-//!
-//! Scenarios: (n_accounts_touched, storage_slots_touched)
-//!   tiny:   50 accounts,   100 slots  (light block)
-//!   small:  500 accounts, 1000 slots  (typical block)
-//!   medium: 2000 accounts, 4000 slots (heavy block)
+//! Competitors:
+//!   lthash_par — O(N) BLAKE3 XOF, fully parallel (rayon), no structural dependency
+//!   mpt        — EthTrie<MemoryDB> serial incremental (O(N × depth) keccak256)
+//!   mpt_par    — 16-way parallel MPT using alloy-trie HashBuilder:
+//!                  1. Storage roots: rayon par_iter over N changed accounts (independent)
+//!                  2. Account trie:  split by first nibble of keccak256(addr) →
+//!                     16 independent subtries computed in parallel via rayon,
+//!                     assembled into root branch node via RLP + keccak256
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_rlp::Encodable;
+use alloy_trie::{HashBuilder, Nibbles, EMPTY_ROOT_HASH};
 use bench::{to_lthash_changes, AccountEntry};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use eth_trie::{EthTrie, MemoryDB, Trie};
 use lthash::{apply_parallel, apply_sequential, AccountState, StateChange, WorldHash};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::sync::Arc;
+use rayon::prelude::*;
+use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 // ── Encoding helpers (shared) ─────────────────────────────────────────────────
 
@@ -119,6 +120,56 @@ impl MptState {
     }
 }
 
+// ── Parallel MPT helpers ──────────────────────────────────────────────────────
+
+/// Compute storage root from a sorted BTreeMap<hashed_slot, value> using HashBuilder.
+fn compute_storage_root_hb(slots: &BTreeMap<B256, U256>) -> B256 {
+    if slots.is_empty() {
+        return EMPTY_ROOT_HASH;
+    }
+    let mut hb = HashBuilder::default();
+    for (hashed_slot, val) in slots {
+        hb.add_leaf(Nibbles::unpack(hashed_slot.as_slice()), &rlp_u256(*val));
+    }
+    hb.root()
+}
+
+/// Compute the root of one first-nibble subtrie using HashBuilder.
+/// Paths have first nibble stripped (caller has already bucketed by it).
+/// Returns None if the bucket is empty (child is absent in branch node).
+fn subtrie_root(bucket: &BTreeMap<B256, Vec<u8>>) -> Option<B256> {
+    if bucket.is_empty() {
+        return None;
+    }
+    let mut hb = HashBuilder::default();
+    for (hashed_addr, encoded) in bucket {
+        let full = Nibbles::unpack(hashed_addr.as_slice());
+        hb.add_leaf(full.slice(1..), encoded);
+    }
+    Some(hb.root())
+}
+
+/// Assemble an MPT root branch node from 16 optional child hashes.
+/// Encodes as RLP list of 17 items (16 children + empty value) then keccak256.
+fn assemble_branch_root(children: &[Option<B256>; 16]) -> B256 {
+    // Payload: each absent child = 1B (0x80), present = 33B (0xa0 + 32B); + 1B value slot
+    let payload: usize =
+        children.iter().map(|c| if c.is_some() { 33 } else { 1 }).sum::<usize>() + 1;
+    let mut buf = Vec::with_capacity(payload + 4);
+    alloy_rlp::Header { list: true, payload_length: payload }.encode(&mut buf);
+    for child in children {
+        match child {
+            None => buf.push(0x80),
+            Some(h) => {
+                buf.push(0xa0); // 0x80 + 32
+                buf.extend_from_slice(h.as_slice());
+            }
+        }
+    }
+    buf.push(0x80); // empty value slot
+    keccak256(&buf)
+}
+
 // ── Block change representation ───────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -158,6 +209,92 @@ impl BlockChange {
             });
         }
         out
+    }
+}
+
+// ── Parallel MPT state ────────────────────────────────────────────────────────
+
+/// Parallel MPT: accounts bucketed by first nibble of keccak256(addr).
+/// - 16 independent subtrie root computations run via rayon
+/// - Storage roots also computed in parallel across changed accounts
+struct ParMptState {
+    /// 16 buckets keyed by first nibble of hashed_addr.
+    /// Each bucket: hashed_addr → RLP([nonce, balance, storage_root, code_hash])
+    buckets: [BTreeMap<B256, Vec<u8>>; 16],
+    /// Per-account storage: hashed_slot → value (BTreeMap for sorted HashBuilder feed)
+    storage: HashMap<Address, BTreeMap<B256, U256>>,
+}
+
+impl ParMptState {
+    fn from_base(accounts: &[AccountEntry]) -> Self {
+        let mut buckets: [BTreeMap<B256, Vec<u8>>; 16] = Default::default();
+        let mut storage = HashMap::with_capacity(accounts.len());
+
+        for acc in accounts {
+            let mut slots: BTreeMap<B256, U256> = BTreeMap::new();
+            for &(slot, val) in &acc.storage {
+                if !val.is_zero() {
+                    slots.insert(keccak256(slot), val);
+                }
+            }
+            let sr = compute_storage_root_hb(&slots);
+            let hashed_addr = keccak256(acc.addr);
+            let encoded = rlp_account(acc.nonce, acc.balance, sr, acc.code_hash);
+            let nibble = (hashed_addr[0] >> 4) as usize;
+            buckets[nibble].insert(hashed_addr, encoded);
+            storage.insert(acc.addr, slots);
+        }
+
+        Self { buckets, storage }
+    }
+
+    fn apply_block(&mut self, changes: &[BlockChange]) -> B256 {
+        // Step 1 (sequential): read current storage and apply slot changes.
+        // Must be sequential because it borrows self.storage per account.
+        let prep: Vec<(usize, B256, u64, U256, B256, BTreeMap<B256, U256>)> = changes
+            .iter()
+            .map(|c| {
+                let hashed_addr = keccak256(c.addr);
+                let nibble = (hashed_addr[0] >> 4) as usize;
+                let mut slots = self.storage.get(&c.addr).cloned().unwrap_or_default();
+                for &(slot, _old, new_val) in &c.storage_changes {
+                    let hs = keccak256(slot);
+                    if new_val.is_zero() {
+                        slots.remove(&hs);
+                    } else {
+                        slots.insert(hs, new_val);
+                    }
+                }
+                (nibble, hashed_addr, c.new_nonce, c.new_balance, c.code_hash, slots)
+            })
+            .collect();
+
+        // Step 2 (parallel): compute storage roots + encode accounts.
+        let encoded: Vec<(usize, B256, Vec<u8>, BTreeMap<B256, U256>)> = prep
+            .into_par_iter()
+            .map(|(nibble, hashed_addr, nonce, balance, code_hash, slots)| {
+                let sr = compute_storage_root_hb(&slots);
+                let enc = rlp_account(nonce, balance, sr, code_hash);
+                (nibble, hashed_addr, enc, slots)
+            })
+            .collect();
+
+        // Step 3 (sequential): update buckets and storage state.
+        for (change, (nibble, hashed_addr, enc, slots)) in changes.iter().zip(encoded) {
+            self.storage.insert(change.addr, slots);
+            self.buckets[nibble].insert(hashed_addr, enc);
+        }
+
+        // Step 4 (parallel): compute 16 independent subtrie roots.
+        let children: [Option<B256>; 16] = self
+            .buckets
+            .par_iter()
+            .map(subtrie_root)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+
+        assemble_branch_root(&children)
     }
 }
 
@@ -272,6 +409,21 @@ fn bench_block_commit(c: &mut Criterion) {
                     // benchmark a single block's delta from the same base.
                     let mut mpt = MptState::from_base(&base.accounts[..n_acc]);
                     mpt.apply_block(changes)
+                });
+            },
+        );
+
+        // ── mpt_par ──────────────────────────────────────────────────────────
+        // 16-way parallel: storage roots computed in parallel per account,
+        // then 16 subtrie roots (split by first nibble) computed in parallel,
+        // assembled into root branch node via RLP + keccak256.
+        group.bench_with_input(
+            BenchmarkId::new("mpt_par", label),
+            &block,
+            |b, changes| {
+                b.iter(|| {
+                    let mut state = ParMptState::from_base(&base.accounts[..n_acc]);
+                    state.apply_block(changes)
                 });
             },
         );
