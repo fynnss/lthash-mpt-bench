@@ -90,6 +90,25 @@ impl StateDb {
         Ok(())
     }
 
+    /// Like [`apply_parallel`] but returns `(hash_duration, commit_duration)`.
+    ///
+    /// `hash_duration`  — time for parallel BLAKE3 XOF delta computation.
+    /// `commit_duration` — time for the atomic RocksDB `WriteBatch` write.
+    pub fn apply_parallel_timed(
+        &mut self,
+        changes: &[StateChange],
+    ) -> Result<(std::time::Duration, std::time::Duration)> {
+        let t0 = std::time::Instant::now();
+        apply_parallel(&mut self.world_hash, changes);
+        let hash_dur = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        self.flush_changes(changes)?;
+        let commit_dur = t1.elapsed();
+
+        Ok((hash_dur, commit_dur))
+    }
+
     /// Write all KV changes + updated world hash to RocksDB in one batch.
     fn flush_changes(&self, changes: &[StateChange]) -> Result<()> {
         let cf_accounts = self.db.cf_handle(CF_ACCOUNTS).unwrap();

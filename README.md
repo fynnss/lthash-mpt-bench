@@ -52,17 +52,21 @@ LtHash TPS is flat across all block sizes (~1.4M/s) — pure O(N), unaffected by
 ### 2 — Full commit with RocksDB
 
 `lthash_rdb`: parallel BLAKE3 delta + single atomic WriteBatch (N flat puts).
-`mpt_rdb`: EthTrie<RocksDB>, O(depth) random node reads+writes per account.
+`mpt_par_rdb`: 16-way parallel `EthTrie<RocksDB>` subtries — same nibble bucketing as `mpt_par`, each subtrie writes its own batch to a shared RocksDB env.
+
+Phase breakdown is printed to stdout on every run (hash vs commit split, TPS per phase).
 
 ```bash
 cargo bench --bench rw_block
 ```
 
-| Block size | lthash_rdb | TPS | mpt_rdb | TPS | Speedup |
+| Block size | lthash_rdb | TPS | mpt_par_rdb | TPS | Speedup |
 |---|---|---|---|---|---|
-| 1k   | **2.1 ms**  | **476k/s** | 27.9 ms  | 35.8k/s | **13×** |
-| 10k  | **21.9 ms** | **457k/s** | 227 ms   | 44k/s   | **10×** |
-| 100k | **193 ms**  | **518k/s** | 1,719 ms | 58.2k/s | **9×**  |
+| 1k   | **2.1 ms**  | **476k/s** | ~27 ms   | ~37k/s  | **~13×** |
+| 10k  | **21.9 ms** | **457k/s** | ~220 ms  | ~45k/s  | **~10×** |
+| 100k | **193 ms**  | **518k/s** | ~1,650ms | ~61k/s  | **~9×**  |
+
+> Numbers will update after re-running with `mpt_par_rdb`. The per-phase breakdown (hash / commit split) is the primary output of this bench.
 
 *Apple M-series, 8 cores, `--release`, `lto = "thin"`.*
 
