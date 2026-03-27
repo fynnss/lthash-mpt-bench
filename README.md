@@ -1,213 +1,85 @@
 # LtHash StateDB
 
-A Rust implementation of **Lattice Hash (LtHash)** as a state commitment scheme for high-performance EVM chains, with a RocksDB-backed flat KV state database and benchmarks comparing it against the Merkle Patricia Trie (MPT).
+**LtHash** (Lattice Hash) as a drop-in replacement for MPT state commitment on high-performance EVM chains. Flat KV + BLAKE3 XOF, no trie overhead.
 
-## Background
+> As deployed on Solana mainnet ([SIMD-0215](https://github.com/solana-foundation/solana-improvement-documents/pull/215)).
 
-At 10k+ TPS, MPT becomes the dominant bottleneck in EVM block production:
-
-- Every state change requires O(log n) random IO to update trie paths
-- Intermediate trie nodes dominate storage (Ethereum state DB > 1 TB, mostly non-leaf overhead)
-- The serial commit path prevents parallel EVM gains — no matter how fast execution is, trie updates still serialize at block end
-
-This project implements and benchmarks an alternative: **Flat KV + LtHash**, as deployed on Solana mainnet ([SIMD-0215](https://github.com/solana-foundation/solana-improvement-documents/pull/215)).
-
-## How LtHash Works
+## How it works
 
 ```
-// Per entry
-entry_hash = BLAKE3_XOF("lthash-evm-state-v1" || key || value)  →  2048 bytes (1024 × u16)
+entry_hash = BLAKE3_XOF(key || value)       →  2048 bytes
+world_hash = Σ entry_hash_i                  (wrapping u16 add, commutative)
+state_root = BLAKE3(world_hash)              →  32 bytes
 
-// Aggregate (commutative, associative)
-world_hash = Σ entry_hash_i   (wrapping u16 addition)
-
-// O(1) incremental update
+// O(changed) incremental update:
 world_hash += hash(new_kv) - hash(old_kv)
-
-// State root
-state_root = BLAKE3(world_hash)  →  32 bytes
 ```
 
-Security is based on the **SIS lattice problem** — 128-bit quantum-safe, same family as NIST PQ standards (ML-KEM/ML-DSA). No trusted setup.
+Commutativity means parallel EVM threads compute deltas independently — no synchronization at commit. MPT path rehashing has structural dependencies that force serialization.
 
-### Why it enables parallelism
+Security: SIS lattice problem, 128-bit quantum-safe.
 
-Because wrapping u16 addition is commutative and associative, parallel EVM threads can independently compute per-change deltas and reduce them with no locks:
-
-```
-// Each thread independently (Block-STM / OCC workers):
-delta_i = hash(new_kv_i) - hash(old_kv_i)
-
-// Commit phase — single reduce, no synchronization barrier:
-new_state_hash = old_state_hash + Σ delta_i
-```
-
-MPT cannot do this: adjacent accounts share branch nodes, so path rehashing has structural dependencies that force serialization.
-
-## Storage Schema
-
-Flat KV, no nested tries:
-
-| Column Family | Key | Value |
-|---|---|---|
-| `accounts`  | `addr (20B)` | `nonce (8B LE) \|\| balance (32B LE) \|\| code_hash (32B)` |
-| `storages`  | `addr (20B) \|\| slot (32B)` | `value (32B BE)` |
-| `bytecodes` | `code_hash (32B)` | bytecode bytes |
-| `meta`      | `"world_hash"` | world hash (2048B), persisted on every commit |
-
-Compared to Reth V2, this removes 4 tables: `HashedAccounts`, `HashedStorages`, `AccountsTrie`, `StoragesTrie`.
-
-## Project Structure
+## Structure
 
 ```
 crates/
-├── lthash/     # Core LtHash algorithm — pure, no DB dependency
-├── state-db/   # RocksDB-backed flat KV state + LtHash commitment
+├── lthash/     # Core algorithm, no DB dependency
+├── state-db/   # RocksDB flat KV + LtHash commitment
 └── bench/      # Criterion benchmarks vs MPT
-```
-
-### `lthash`
-
-```rust
-use lthash::{WorldHash, StateChange, AccountState, apply_parallel};
-
-// Build world hash from initial state (e.g. genesis or snapshot load)
-let mut world = WorldHash::new();
-apply_parallel(&mut world, &initial_changes);
-
-// Per-block incremental update — O(changed entries), independent of total state size
-apply_parallel(&mut world, &block_changes);
-
-// 32-byte state root, compatible with existing block header format
-let state_root: B256 = world.state_root();
-```
-
-### `state-db`
-
-```rust
-use state_db::StateDb;
-
-let mut db = StateDb::open("/path/to/db")?;
-
-// Apply block changes: parallel WorldHash update + atomic RocksDB WriteBatch
-db.apply_parallel(&changes)?;
-
-// Flat reads — O(1) point lookup, no trie traversal
-let account = db.get_account(&addr)?;
-let value   = db.get_storage(&addr, &slot)?;
-
-// State root always available in O(1), no recomputation needed
-let root = db.state_root();
 ```
 
 ## Benchmarks
 
-### Workload model
+Base state: **1M accounts**. Each block updates N accounts. **All latency figures are per-block.**
 
-Benchmarks use a **100k-account base state** (4 storage slots per account) representing an established chain. Block-level state change volumes are derived from a 10k TPS / 1s block time assumption with a realistic mixed workload:
+### 1 — Pure hash (in-memory)
 
-| Tx type | Share | Acct writes/tx | Storage writes/tx |
-|---|---|---|---|
-| ETH transfer | 30% | 2 (sender + receiver) | 0 |
-| ERC-20 transfer | 40% | 3 (sender, receiver, contract) | 2 (balances) |
-| DeFi (swap/lend) | 30% | ~7 | ~10 |
+`lthash_par`: parallel BLAKE3 XOF deltas, O(N).
+`mpt_par`: 16 independent EthTrie subtries (bucketed by first nibble of keccak256), updated in parallel via rayon, O(N × depth / 16).
 
-After applying ~40% deduplication for hot wallets/contracts, three scenarios are tested:
-
-| Scenario | Unique accounts | Unique storage slots | Total changes | Representative workload |
-|---|---|---|---|---|
-| `conservative_25k` | 11,700 | 13,300 | **25,000** | Token transfers dominate, high address reuse |
-| `typical_50k` | 23,400 | 26,600 | **50,000** | Balanced DeFi + transfer mix |
-| `heavy_100k` | 46,800 | 53,200 | **100,000** | DeFi-heavy, low address reuse |
-
-### Benchmark 1 — Pure hash computation (no DB IO)
-
-Models the **async-write path**: execution results are buffered in memory, DB writes happen asynchronously via WAL. Only the state root computation is on the critical path.
-
-```
+```bash
 cargo bench --bench state_root
 ```
 
-Base state: **1M accounts × 4 storage slots** (realistic established chain). Three competitors, all operating in memory:
+| Block size | lthash_par | TPS | mpt_par | TPS | Speedup |
+|---|---|---|---|---|---|
+| 1k   | **0.85 ms** | **1.18M/s** | 4.4 ms  | 227k/s | **5.2×** |
+| 10k  | **7.3 ms**  | **1.37M/s** | 36.5 ms | 274k/s | **5.0×** |
+| 100k | **71.7 ms** | **1.39M/s** | 230 ms  | 435k/s | **3.2×** |
 
-- **`lthash_par`**: world hash built from all 1M accounts once; each block clones the 2048-byte accumulator and applies O(N) BLAKE3 XOF operations where N = changed entries
-- **`mpt_par`**: 16-way parallel MPT (`alloy-trie` `HashBuilder`) built from all 1M accounts; each block recomputes all 16 subtrie roots from the full bucket contents — **not truly incremental** (O(total accounts) per block, not O(changed))
-- **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB`, truly incremental — only rehashes modified trie paths — but limited to n_acc accounts due to memory (understates real MPT cost at 1M scale)
+LtHash TPS is flat across all block sizes (~1.4M/s) — pure O(N), unaffected by total state size.
 
-| Scenario | lthash_par | mpt_par | mpt (serial) |
-|---|---|---|---|
-| conservative 25k | **17 ms** | 76 ms | 122 ms |
-| typical 50k | **34 ms** | 100 ms | 250 ms |
-| heavy 100k | **67 ms** | 142 ms | 516 ms |
+### 2 — Full commit with RocksDB
 
-Assuming 1s block time and the given scenario represents ~10k TPS:
+`lthash_rdb`: parallel BLAKE3 delta + single atomic WriteBatch (N flat puts).
+`mpt_rdb`: EthTrie<RocksDB>, O(depth) random node reads+writes per account.
 
-| Scenario | lthash_par | mpt_par | mpt (serial) |
-|---|---|---|---|
-| conservative 25k | **588k TPS** | 329k TPS | 205k TPS |
-| typical 50k | **294k TPS** | 500k TPS | 200k TPS |
-| heavy 100k | **149k TPS** | 704k TPS | 194k TPS |
-
-> Max TPS capacity if state-root computation is the sole bottleneck.
-
-**Key insight — O(changed) vs O(total)**:
-
-`lthash_par` times scale perfectly with block size: 17 → 34 → 67 ms (2× / 4× for 2× / 4× more changes). This is the O(N) guarantee — update cost is independent of total state size. Whether there are 1M or 100M accounts in the base state, applying 25k changes always costs the same.
-
-`mpt_par` does not achieve true incrementality: `HashBuilder` is a streaming batch builder, not a persistent trie. Each block feeds all 1M accounts (62.5k per bucket) through the hash builder, making it O(total accounts) per block regardless of how much changed. A genuinely incremental parallel MPT would need 16 independent persistent trie instances (one per nibble bucket), recovering O(changed × depth / 16) at the cost of much higher memory.
-
-`mpt` (serial) is truly incremental — O(changed × depth) — but cannot be parallelised due to shared branch nodes.
-
-### Benchmark 2 — Full pipeline with RocksDB (both sides)
-
-Models the **sync-write path**: read old state → compute new root → persist to RocksDB, all on the critical path. Both competitors use the same RocksDB engine for a fair comparison.
-
-```
+```bash
 cargo bench --bench rw_block
 ```
 
-- **`lthash_par`**: `multi_get` (1 read/entry, flat KV) + parallel BLAKE3 + `WriteBatch` (1 write/entry)
-- **`mpt_rocksdb`**: `eth_trie` with a custom `rocksdb` backend — trie node reads are O(depth) per changed entry, node writes are O(depth) per changed entry
+| Block size | lthash_rdb | TPS | mpt_rdb | TPS | Speedup |
+|---|---|---|---|---|---|
+| 1k   | **2.1 ms**  | **476k/s** | 27.9 ms  | 35.8k/s | **13×** |
+| 10k  | **21.9 ms** | **457k/s** | 227 ms   | 44k/s   | **10×** |
+| 100k | **193 ms**  | **518k/s** | 1,719 ms | 58.2k/s | **9×**  |
 
-| Scenario | lthash_par | mpt_rocksdb | Speedup |
-|---|---|---|---|
-| conservative 25k | **136 ms** | 379 ms | 2.8× |
-| typical 50k | **236 ms** | 734 ms | 3.1× |
-| heavy 100k | **460 ms** | 1,418 ms | 3.1× |
-
-The gap narrows vs. benchmark 1 because both sides now pay RocksDB IO. LtHash's advantage comes from flat access patterns (1 read and 1 write per entry) vs. MPT's O(depth) random node accesses per entry.
-
-*All results: Apple M-series, 8 cores, `--release` with `lto = "thin"`.*
-
-### Running the benchmarks
-
-```bash
-cargo test                       # unit tests
-cargo bench                      # all benchmarks
-cargo bench --bench state_root   # pure hash only
-cargo bench --bench rw_block     # full read-write pipeline
-```
+*Apple M-series, 8 cores, `--release`, `lto = "thin"`.*
 
 ## Trade-offs
 
 | | LtHash | MPT |
 |---|---|---|
-| State root update | O(changed) | O(changed × log n) |
-| Parallel update | Yes — commutative, no locks | No — path dependencies |
-| Storage overhead | ~2 KB (world hash only) | High (branch/extension nodes) |
-| Inclusion proofs | **No** | Yes |
-| Quantum-safe | Yes (SIS lattice) | No (keccak256) |
-| Light client support | No — needs async proof layer | Yes |
+| Update cost | O(changed) | O(changed × log n) |
+| Parallel-safe | Yes | No |
+| Storage overhead | 2 KB | High (branch nodes) |
+| Inclusion proofs | No | Yes |
+| Quantum-safe | Yes (SIS) | No |
 
-The core trade-off is **no native inclusion proofs**. `eth_getProof` and storage-proof bridges require adaptation. Mitigation options:
-
-- **Receipt/tx tries**: retained as-is — per-block structures unaffected by this change
-- **Async proof layer**: a prover network builds an SMT/binary tree from state diffs and periodically anchors a verifiable root back on-chain
-- **Guardian attestation**: N/M multi-sig for cross-chain bridges (Wormhole-style), available from day one
+No native inclusion proofs — `eth_getProof` requires an async proof layer or guardian attestation for bridges.
 
 ## References
 
-- [Solana SIMD-0215: Accounts Lattice Hash](https://github.com/solana-foundation/solana-improvement-documents/pull/215)
-- [Bellare & Micciancio: Securing Update Propagation with Homomorphic Hashing (2019)](https://eprint.iacr.org/2019/227)
-- [EIP-6800: Verkle Tree State](https://eips.ethereum.org/EIPS/eip-6800)
-- [EIP-7864: Ethereum State Using a Unified Binary Tree](https://eips.ethereum.org/EIPS/eip-7864)
+- [Solana SIMD-0215](https://github.com/solana-foundation/solana-improvement-documents/pull/215)
+- [Bellare & Micciancio 2019](https://eprint.iacr.org/2019/227)
+- [EIP-6800: Verkle Tree](https://eips.ethereum.org/EIPS/eip-6800)

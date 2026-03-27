@@ -1,75 +1,52 @@
-//! Shared utilities for benchmarks and tests.
+//! Shared utilities for benchmarks.
 
 use alloy_primitives::{Address, B256, U256};
+use lthash::AccountState;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-/// A generated state snapshot: a set of (address, nonce, balance, storage slots).
+/// A generated account in the base state.
 #[derive(Clone)]
-pub struct GeneratedState {
-    pub accounts: Vec<AccountEntry>,
-}
-
-#[derive(Clone)]
-pub struct AccountEntry {
+pub struct Account {
     pub addr: Address,
     pub nonce: u64,
     pub balance: U256,
-    pub code_hash: B256,
-    pub storage: Vec<(B256, U256)>,
 }
 
-/// Generate a reproducible random state with `n_accounts` accounts,
-/// each with `slots_per_account` storage slots.
-pub fn generate_state(
-    n_accounts: usize,
-    slots_per_account: usize,
-    seed: u64,
-) -> GeneratedState {
+/// Pre-computed (old, new) pair for one account — simulates the EVM pre-state cache.
+#[derive(Clone)]
+pub struct AccountDelta {
+    pub addr: Address,
+    pub old: AccountState,
+    pub new: AccountState,
+}
+
+/// Generate `n` deterministic random accounts with the given `seed`.
+pub fn gen_accounts(n: usize, seed: u64) -> Vec<Account> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let accounts = (0..n_accounts)
-        .map(|_| {
-            let addr = Address::from_slice(&rng.gen::<[u8; 20]>());
-            let nonce = rng.gen::<u64>() & 0xFFFF; // keep small
-            let balance = U256::from(rng.gen::<u128>());
-            let code_hash = if rng.gen_bool(0.1) {
-                B256::from(rng.gen::<[u8; 32]>())
-            } else {
-                B256::ZERO
-            };
-            let storage = (0..slots_per_account)
-                .map(|_| {
-                    let slot = B256::from(rng.gen::<[u8; 32]>());
-                    let value = U256::from(rng.gen::<u128>());
-                    (slot, value)
-                })
-                .collect();
-            AccountEntry { addr, nonce, balance, code_hash, storage }
+    (0..n)
+        .map(|_| Account {
+            addr: Address::from_slice(&rng.gen::<[u8; 20]>()),
+            nonce: rng.gen::<u64>() & 0xFFFF,
+            balance: U256::from(rng.gen::<u128>()),
         })
-        .collect();
-    GeneratedState { accounts }
+        .collect()
 }
 
-/// Convert generated state to LtHash StateChanges (all inserts).
-pub fn to_lthash_changes(state: &GeneratedState) -> Vec<lthash::StateChange> {
-    let mut changes = Vec::new();
-    for acc in &state.accounts {
-        changes.push(lthash::StateChange::Account {
-            addr: acc.addr,
-            old: None,
-            new: lthash::AccountState {
-                nonce: acc.nonce,
-                balance: acc.balance,
-                code_hash: acc.code_hash,
+/// Generate a block touching the first `n` accounts from `base`.
+///
+/// Returns pre-computed (old, new) pairs — nonce+1, balance incremented by a random u64.
+pub fn gen_block(base: &[Account], n: usize) -> Vec<AccountDelta> {
+    let mut rng = StdRng::seed_from_u64(42);
+    base[..n]
+        .iter()
+        .map(|a| AccountDelta {
+            addr: a.addr,
+            old: AccountState { nonce: a.nonce, balance: a.balance, code_hash: B256::ZERO },
+            new: AccountState {
+                nonce: a.nonce + 1,
+                balance: a.balance + U256::from(rng.gen::<u64>()),
+                code_hash: B256::ZERO,
             },
-        });
-        for &(slot, value) in &acc.storage {
-            changes.push(lthash::StateChange::Storage {
-                addr: acc.addr,
-                slot,
-                old_value: U256::ZERO,
-                new_value: value,
-            });
-        }
-    }
-    changes
+        })
+        .collect()
 }
