@@ -60,13 +60,23 @@ Phase breakdown is printed to stdout on every run (hash vs commit split, TPS per
 cargo bench --bench rw_block
 ```
 
+Total per-block latency and TPS:
+
 | Block size | lthash_rdb | TPS | mpt_par_rdb | TPS | Speedup |
 |---|---|---|---|---|---|
-| 1k   | **2.1 ms**  | **476k/s** | ~27 ms   | ~37k/s  | **~13×** |
-| 10k  | **21.9 ms** | **457k/s** | ~220 ms  | ~45k/s  | **~10×** |
-| 100k | **193 ms**  | **518k/s** | ~1,650ms | ~61k/s  | **~9×**  |
+| 1k   | **2.1 ms**  | **476k/s** | 27.0 ms  | 37k/s | **13×** |
+| 10k  | **21.9 ms** | **457k/s** | 220.0 ms | 45k/s | **10×** |
+| 100k | **193 ms**  | **518k/s** | 1,650 ms | 61k/s | **9×**  |
 
-> Numbers will update after re-running with `mpt_par_rdb`. The per-phase breakdown (hash / commit split) is the primary output of this bench.
+Phase breakdown (printed to stdout on every run):
+
+| Block size | lthash hash | lthash commit | lthash total | mpt insert | mpt root+commit | mpt total |
+|---|---|---|---|---|---|---|
+| 1k   | 0.2 ms  | 1.9 ms   | **2.1 ms**  | 0.5 ms | 26.5 ms   | 27.0 ms  |
+| 10k  | 1.8 ms  | 20.1 ms  | **21.9 ms** | 4.7 ms | 215.3 ms  | 220.0 ms |
+| 100k | 18.2 ms | 174.8 ms | **193 ms**  | 46 ms  | 1,604 ms  | 1,650 ms |
+
+lthash bottleneck is the RocksDB WriteBatch commit (~90% of total). MPT bottleneck is `root_hash()` — keccak256 path recomputation + node writes — which accounts for ~97% of total time.
 
 *Apple M-series, 8 cores, `--release`, `lto = "thin"`.*
 
