@@ -217,6 +217,7 @@ impl BlockChange {
 /// Parallel MPT: accounts bucketed by first nibble of keccak256(addr).
 /// - 16 independent subtrie root computations run via rayon
 /// - Storage roots also computed in parallel across changed accounts
+#[derive(Clone)]
 struct ParMptState {
     /// 16 buckets keyed by first nibble of hashed_addr.
     /// Each bucket: hashed_addr → RLP([nonce, balance, storage_root, code_hash])
@@ -344,15 +345,17 @@ fn generate_block_changes(
 // ── Benchmark ─────────────────────────────────────────────────────────────────
 
 fn bench_block_commit(c: &mut Criterion) {
-    // Base state: 100k accounts, 4 storage slots each — represents chain history
-    const BASE_ACCOUNTS: usize = 100_000;
+    // Base state: 1M accounts, 4 storage slots each — realistic established chain.
+    // LtHash world hash is built from ALL 1M accounts to demonstrate that its
+    // incremental update cost is O(block changes), not O(total state).
+    const BASE_ACCOUNTS: usize = 1_000_000;
     const BASE_SLOTS: usize = 4;
 
-    println!("Building base state ({BASE_ACCOUNTS} accounts × {BASE_SLOTS} slots)…");
+    println!("Generating base state ({BASE_ACCOUNTS} accounts × {BASE_SLOTS} slots)…");
     let base = bench::generate_state(BASE_ACCOUNTS, BASE_SLOTS, 1);
 
     // Scenarios based on 10k TPS / 1s block estimate:
-    //   conservative: ~25k changes (11.7k accounts + 13.3k slots, lots of hot-wallet overlap)
+    //   conservative: ~25k changes (11.7k accounts + 13.3k slots)
     //   typical:      ~50k changes (23.4k accounts + 26.6k slots)
     //   heavy:        ~100k changes (46.8k accounts + 53.2k slots, DeFi-heavy)
     let scenarios: &[(&str, usize, usize)] = &[
@@ -361,14 +364,20 @@ fn bench_block_commit(c: &mut Criterion) {
         ("heavy_100k",       46_800, 53_200),
     ];
 
-    // ── LtHash: build initial WorldHash from base state ─────────────────────
-    println!("Building LtHash base world hash…");
+    // ── LtHash: build world hash from ALL 1M accounts ───────────────────────
+    // This is the persistent state commitment; update cost is always O(changed).
+    println!("Building LtHash world hash from {BASE_ACCOUNTS} accounts (one-time)…");
     let base_changes = to_lthash_changes(&base);
     let mut base_world = WorldHash::new();
     apply_sequential(&mut base_world, &base_changes);
 
-    // MPT base trie is built fresh per scenario (cloning 100k accounts is expensive;
-    // we instead build per-scenario sub-tries in the benchmark itself)
+    // ── mpt_par: build ParMptState from ALL 1M accounts ─────────────────────
+    // Kept in memory across blocks; represents realistic persistent trie state.
+    println!("Building mpt_par base state from {BASE_ACCOUNTS} accounts (one-time)…");
+    let base_par_mpt = ParMptState::from_base(&base.accounts);
+
+    // ── mpt (EthTrie): too memory-intensive for 1M accounts; built per scenario
+    // from n_acc accounts only (understates MPT cost — real depth would be deeper).
 
     println!("Setup done. Running benchmarks…\n");
 
@@ -376,11 +385,12 @@ fn bench_block_commit(c: &mut Criterion) {
 
     for &(label, n_acc, n_slots) in scenarios {
         let block = generate_block_changes(&base.accounts, n_acc, n_slots, 42);
-        let total_changes = n_acc + n_slots; // accounts + storage slots touched
+        let total_changes = n_acc + n_slots;
         group.throughput(Throughput::Elements(total_changes as u64));
 
-        // O(n_acc + n_slots) BLAKE3 XOF operations, parallel via rayon.
-        // No state-size dependency — cost depends only on changed entries.
+        // ── lthash_par ───────────────────────────────────────────────────────
+        // Clone 2048-byte world hash (built from 1M accounts) + apply N changes.
+        // Update cost is O(N), independent of total state size.
         let lthash_changes: Vec<StateChange> =
             block.iter().flat_map(|c| c.to_lthash_changes()).collect();
 
@@ -396,25 +406,25 @@ fn bench_block_commit(c: &mut Criterion) {
             },
         );
 
-        // ── MPT incremental ──────────────────────────────────────────────────
-        // Build the trie ONCE and keep it alive across all iterations.
-        // Each iter applies the same block delta on top of the previous state —
-        // same number of nodes touched per block, same depth, representative timing.
+        // ── mpt_par ──────────────────────────────────────────────────────────
+        // ParMptState built from 1M accounts; apply block changes each iteration.
+        // 16-way parallel: storage roots + 16 subtrie roots via rayon.
+        {
+            let mut state = base_par_mpt.clone();
+            let changes = block.clone();
+            group.bench_function(BenchmarkId::new("mpt_par", label), move |b| {
+                b.iter(|| state.apply_block(&changes));
+            });
+        }
+
+        // ── mpt (serial, EthTrie) ─────────────────────────────────────────────
+        // Built from n_acc accounts only (memory limit); understates real MPT cost
+        // since 1M-account trie would be deeper and have more cache misses.
         {
             let mut mpt = MptState::from_base(&base.accounts[..n_acc]);
             let changes = block.clone();
             group.bench_function(BenchmarkId::new("mpt", label), move |b| {
                 b.iter(|| mpt.apply_block(&changes));
-            });
-        }
-
-        // ── mpt_par ──────────────────────────────────────────────────────────
-        // Same: one ParMptState kept in memory, block applied each iteration.
-        {
-            let mut state = ParMptState::from_base(&base.accounts[..n_acc]);
-            let changes = block.clone();
-            group.bench_function(BenchmarkId::new("mpt_par", label), move |b| {
-                b.iter(|| state.apply_block(&changes));
             });
         }
     }

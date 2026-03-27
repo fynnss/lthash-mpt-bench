@@ -128,32 +128,35 @@ Models the **async-write path**: execution results are buffered in memory, DB wr
 cargo bench --bench state_root
 ```
 
-Three competitors operate entirely in memory, each applied **incrementally** to a pre-built state (no rebuild per block):
-- **`lthash_par`**: clone 2048-byte world hash + rayon parallel BLAKE3 XOF per entry + wrapping-add reduce
-- **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB`, kept in memory across blocks — incremental O(n × depth) keccak256 per changed entry
-- **`mpt_par`**: 16-way parallel MPT using alloy-trie `HashBuilder`, kept in memory across blocks:
-  1. Storage roots: rayon `par_iter` over N changed accounts (each independent)
-  2. Account trie: split by first nibble of `keccak256(addr)` → 16 independent subtries computed in parallel, assembled into root branch node via RLP + keccak256
+Base state: **1M accounts × 4 storage slots** (realistic established chain). Three competitors, all operating in memory:
 
-| Scenario | lthash_par | mpt_par | mpt (serial) | mpt_par vs mpt |
-|---|---|---|---|---|
-| conservative 25k | 40 ms | **14 ms** | 122 ms | 8.7× |
-| typical 50k | 40 ms | **33 ms** | 247 ms | 7.5× |
-| heavy 100k | 78 ms | **58 ms** | 516 ms | 8.9× |
+- **`lthash_par`**: world hash built from all 1M accounts once; each block clones the 2048-byte accumulator and applies O(N) BLAKE3 XOF operations where N = changed entries
+- **`mpt_par`**: 16-way parallel MPT (`alloy-trie` `HashBuilder`) built from all 1M accounts; each block recomputes all 16 subtrie roots from the full bucket contents — **not truly incremental** (O(total accounts) per block, not O(changed))
+- **`mpt`**: [`eth_trie`](https://crates.io/crates/eth_trie) with `MemoryDB`, truly incremental — only rehashes modified trie paths — but limited to n_acc accounts due to memory (understates real MPT cost at 1M scale)
+
+| Scenario | lthash_par | mpt_par | mpt (serial) |
+|---|---|---|---|
+| conservative 25k | **17 ms** | 76 ms | 122 ms |
+| typical 50k | **34 ms** | 100 ms | 250 ms |
+| heavy 100k | **67 ms** | 142 ms | 516 ms |
 
 Assuming 1s block time and the given scenario represents ~10k TPS:
 
 | Scenario | lthash_par | mpt_par | mpt (serial) |
 |---|---|---|---|
-| conservative 25k | 250k TPS | **714k TPS** | 82k TPS |
-| typical 50k | 250k TPS | **303k TPS** | 40k TPS |
-| heavy 100k | 128k TPS | **172k TPS** | 19k TPS |
+| conservative 25k | **588k TPS** | 329k TPS | 205k TPS |
+| typical 50k | **294k TPS** | 500k TPS | 200k TPS |
+| heavy 100k | **149k TPS** | 704k TPS | 194k TPS |
 
 > Max TPS capacity if state-root computation is the sole bottleneck.
 
-**Key insight**: in pure in-memory computation, `mpt_par` is faster than `lthash_par` because LtHash generates **2048 bytes of XOF output per entry** (25k entries × 2048B = 50 MB of BLAKE3 output), while `mpt_par`'s HashBuilder processes far less data per entry. Serial MPT is 7–9× slower than `mpt_par` due to O(depth) keccak256 traversal that cannot be parallelised.
+**Key insight — O(changed) vs O(total)**:
 
-LtHash's real advantage emerges in the **full RW pipeline** (Benchmark 2) where flat KV access patterns (1 DB read + 1 write per entry) vs MPT's O(depth) random trie node reads dominate the runtime.
+`lthash_par` times scale perfectly with block size: 17 → 34 → 67 ms (2× / 4× for 2× / 4× more changes). This is the O(N) guarantee — update cost is independent of total state size. Whether there are 1M or 100M accounts in the base state, applying 25k changes always costs the same.
+
+`mpt_par` does not achieve true incrementality: `HashBuilder` is a streaming batch builder, not a persistent trie. Each block feeds all 1M accounts (62.5k per bucket) through the hash builder, making it O(total accounts) per block regardless of how much changed. A genuinely incremental parallel MPT would need 16 independent persistent trie instances (one per nibble bucket), recovering O(changed × depth / 16) at the cost of much higher memory.
+
+`mpt` (serial) is truly incremental — O(changed × depth) — but cannot be parallelised due to shared branch nodes.
 
 ### Benchmark 2 — Full pipeline with RocksDB (both sides)
 
