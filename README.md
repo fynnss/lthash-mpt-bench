@@ -43,9 +43,9 @@ cargo bench --bench state_root
 
 | Block size | lthash_par | TPS | mpt_par | TPS | Speedup |
 |---|---|---|---|---|---|
-| 1k   | **0.85 ms** | **1.18M/s** | 4.4 ms  | 227k/s | **5.2×** |
-| 10k  | **7.3 ms**  | **1.37M/s** | 36.5 ms | 274k/s | **5.0×** |
-| 100k | **71.7 ms** | **1.39M/s** | 230 ms  | 435k/s | **3.2×** |
+| 1k   | **0.95 ms** | **1.05M/s** | 5.1 ms  | 197k/s | **5.3×** |
+| 10k  | **8.5 ms**  | **1.18M/s** | 37.7 ms | 265k/s | **4.4×** |
+| 100k | **82.9 ms** | **1.21M/s** | 248 ms  | 403k/s | **3.0×** |
 
 LtHash TPS is flat across all block sizes (~1.4M/s) — pure O(N), unaffected by total state size.
 
@@ -60,26 +60,30 @@ Phase breakdown is printed to stdout on every run (hash vs commit split, TPS per
 cargo bench --bench rw_block
 ```
 
-Total per-block latency and TPS:
+Total per-block latency and TPS (Criterion p50):
 
 | Block size | lthash_rdb | TPS | mpt_par_rdb | TPS | Speedup |
 |---|---|---|---|---|---|
-| 1k   | **2.1 ms**  | **476k/s** | 27.0 ms  | 37k/s | **13×** |
-| 10k  | **21.9 ms** | **457k/s** | 220.0 ms | 45k/s | **10×** |
-| 100k | **193 ms**  | **518k/s** | 1,650 ms | 61k/s | **9×**  |
+| 1k   | **2.3 ms**  | **429k/s** | 12.1 ms | 82k/s  | **5.2×** |
+| 10k  | **21.8 ms** | **459k/s** | 81.7 ms | 122k/s | **3.7×** |
+| 100k | **221 ms**  | **451k/s** | 518 ms  | 193k/s | **2.3×** |
 
-Phase breakdown (printed to stdout on every run):
+Phase breakdown — printed to stdout on every run (avg over 5 blocks):
 
-- **lthash**: `hash` (BLAKE3 XOF) + `commit` (encode accounts + WriteBatch + `db.write`)
+- **lthash**: `hash` (BLAKE3 XOF) + `commit` (encode + WriteBatch + `db.write`)
 - **mpt**: `insert` (in-memory trie node updates) + `root` (keccak path recompute, writes buffered) + `commit` (`db.write` flush)
 
 | | lt:hash | lt:commit | lt:total | lt:TPS | mpt:insert | mpt:root | mpt:commit | mpt:total | mpt:TPS |
 |---|---|---|---|---|---|---|---|---|---|
-| 1k   | 0.2 ms  | 1.9 ms   | **2.1 ms**  | **476k/s** | 0.5 ms | 3.5 ms  | 23 ms    | 27 ms    | 37k/s |
-| 10k  | 1.8 ms  | 20.1 ms  | **21.9 ms** | **457k/s** | 4.7 ms | 34 ms   | 181 ms   | 220 ms   | 45k/s |
-| 100k | 18.2 ms | 174.8 ms | **193 ms**  | **518k/s** | 46 ms  | 320 ms  | 1,284 ms | 1,650 ms | 61k/s |
+| 1k   | 1.4 ms  | 0.6 ms   | **2.0 ms**  | **503k/s** | 7.0 ms | 2.7 ms  | 6.1 ms  | 15.8 ms | 63k/s  |
+| 10k  | 9.1 ms  | 6.0 ms   | **15.1 ms** | **663k/s** | 41.9 ms | 13.8 ms | 42.6 ms | 98.3 ms | 102k/s |
+| 100k | 78.6 ms | 132 ms   | **211 ms**  | **475k/s** | 245 ms | 86.3 ms | 240 ms  | 571 ms  | 175k/s |
 
-> Phase numbers are estimates; re-run to get exact figures for your hardware.
+Notable patterns:
+- **lthash commit** dominates at 100k (132 ms) — `db.write` with a large flat WriteBatch
+- **mpt insert** is the heaviest phase (trie path traversal with per-node HashMap lookups for buffering)
+- **mpt TPS improves** with block size (63k → 175k/s) — parallel subtries amortize overhead better at larger blocks
+- The parallel MPT closes the gap vs serial MPT (~10× old → ~3-5× now) but lthash still wins on predictability and peak TPS
 
 *Apple M-series, 8 cores, `--release`, `lto = "thin"`.*
 

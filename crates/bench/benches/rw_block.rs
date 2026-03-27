@@ -72,24 +72,28 @@ fn assemble_branch_root(children: &[Option<B256>; 16]) -> B256 {
 
 // ── RocksDB backend for EthTrie — with write buffering ───────────────────────
 //
-// All writes (insert / insert_batch) are collected in `pending` instead of
-// going to RocksDB immediately.  Call `flush_pending()` to write the batch.
-// This lets us time the root-hash phase (keccak recompute) independently from
-// the actual RocksDB write phase.
+// Writes (insert / insert_batch / remove) are buffered in a HashMap instead of
+// going to RocksDB immediately.  Reads (get) check the buffer first, then fall
+// back to RocksDB — this is required because eth_trie verifies the root node
+// exists via get() immediately after root_hash() commits dirty nodes.
 //
-// Reads (get) always go to RocksDB.  EthTrie keeps a node cache so in practice
-// reads after the first block rarely hit the DB.
+// Call flush_pending() to convert the buffer to a WriteBatch and write to DB.
+// This lets us time the root-hash phase (keccak recompute + buffer fill)
+// independently from the actual RocksDB write phase.
+
+use std::collections::HashMap;
 
 struct PrefixedRocksDb {
     db: Arc<DB>,
     cf_name: &'static str,
     prefix: Vec<u8>,
-    pending: Mutex<WriteBatch>,
+    /// Pending writes: prefixed_key → Some(value) for puts, None for deletes.
+    pending: Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>,
 }
 
 impl PrefixedRocksDb {
     fn new(db: Arc<DB>, cf_name: &'static str, prefix: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { db, cf_name, prefix, pending: Mutex::new(WriteBatch::default()) })
+        Arc::new(Self { db, cf_name, prefix, pending: Mutex::new(HashMap::new()) })
     }
 
     fn prefixed(&self, key: &[u8]) -> Vec<u8> {
@@ -103,9 +107,19 @@ impl PrefixedRocksDb {
         self.db.cf_handle(self.cf_name).unwrap()
     }
 
-    /// Write all buffered operations to RocksDB and clear the buffer.
+    /// Flush buffered writes to RocksDB via a single WriteBatch, then clear buffer.
     fn flush_pending(&self) -> Result<(), rocksdb::Error> {
-        let batch = std::mem::take(&mut *self.pending.lock().unwrap());
+        let mut pending = self.pending.lock().unwrap();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for (k, v) in pending.drain() {
+            match v {
+                Some(val) => batch.put_cf(self.cf(), &k, val),
+                None => batch.delete_cf(self.cf(), &k),
+            }
+        }
         self.db.write(batch)
     }
 }
@@ -113,28 +127,33 @@ impl PrefixedRocksDb {
 impl TrieDB for PrefixedRocksDb {
     type Error = rocksdb::Error;
 
+    /// Read-through: check pending buffer first, then RocksDB.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.db.get_cf(self.cf(), self.prefixed(key))
+        let pk = self.prefixed(key);
+        if let Some(entry) = self.pending.lock().unwrap().get(&pk) {
+            return Ok(entry.clone());
+        }
+        self.db.get_cf(self.cf(), &pk)
     }
     fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
-        self.pending.lock().unwrap().put_cf(self.cf(), self.prefixed(key), value);
+        self.pending.lock().unwrap().insert(self.prefixed(key), Some(value));
         Ok(())
     }
     fn insert_batch(&self, keys: Vec<Vec<u8>>, values: Vec<Vec<u8>>) -> Result<(), Self::Error> {
-        let mut batch = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
         for (k, v) in keys.into_iter().zip(values) {
-            batch.put_cf(self.cf(), self.prefixed(&k), v);
+            pending.insert(self.prefixed(&k), Some(v));
         }
         Ok(())
     }
     fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        self.pending.lock().unwrap().delete_cf(self.cf(), self.prefixed(key));
+        self.pending.lock().unwrap().insert(self.prefixed(key), None);
         Ok(())
     }
     fn remove_batch(&self, keys: &[Vec<u8>]) -> Result<(), Self::Error> {
-        let mut batch = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
         for k in keys {
-            batch.delete_cf(self.cf(), self.prefixed(k));
+            pending.insert(self.prefixed(k), None);
         }
         Ok(())
     }
