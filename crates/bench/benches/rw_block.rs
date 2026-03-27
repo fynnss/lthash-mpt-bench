@@ -283,13 +283,13 @@ fn print_phase_breakdown(
     mpt_buckets_map: &[[Vec<([u8; 32], Vec<u8>)>; 16]],
 ) {
     println!(
-        "\n╔══ RocksDB Phase Breakdown — avg over {PHASE_ROUNDS} blocks ══════════════════════════════════════════════════════╗"
+        "\n╔══ RocksDB Phase Breakdown — avg over {PHASE_ROUNDS} blocks ══════════════════════════════════════════════╗"
     );
     println!(
-        "║  {:<6}  {:<10} {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
+        "║  {:<6}  {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
         "block",
-        "lt:hash", "lt:build", "lt:write", "lt:total", "lt:TPS",
-        "mpt:insert", "mpt:root", "mpt:write", "mpt:total", "mpt:TPS",
+        "lt:hash", "lt:commit", "lt:total", "lt:TPS",
+        "mpt:insert", "mpt:root", "mpt:commit", "mpt:total", "mpt:TPS",
     );
     println!(
         "╠══════════════════════════════════════════════════════════════════════════════════════════════════════════╣"
@@ -300,39 +300,36 @@ fn print_phase_breakdown(
         let buckets = &mpt_buckets_map[idx];
 
         let mut lh_hash = Duration::ZERO;
-        let mut lh_build = Duration::ZERO;
-        let mut lh_write = Duration::ZERO;
+        let mut lh_commit = Duration::ZERO;
         let mut mpt_insert = Duration::ZERO;
         let mut mpt_root = Duration::ZERO;
-        let mut mpt_write = Duration::ZERO;
+        let mut mpt_commit = Duration::ZERO;
 
         for _ in 0..PHASE_ROUNDS {
-            let (h, b, w) = lthash_db.apply_parallel_timed(lthash_changes).unwrap();
+            let (h, c) = lthash_db.apply_parallel_timed(lthash_changes).unwrap();
             lh_hash += h;
-            lh_build += b;
-            lh_write += w;
+            lh_commit += c;
 
-            let (i, r, w2, _) = mpt_state.apply_block_timed(buckets);
+            let (i, r, w, _) = mpt_state.apply_block_timed(buckets);
             mpt_insert += i;
             mpt_root += r;
-            mpt_write += w2;
+            mpt_commit += w;
         }
 
         let r = PHASE_ROUNDS as u32;
         let lh_h = lh_hash / r;
-        let lh_b = lh_build / r;
-        let lh_w = lh_write / r;
-        let lh_tot = lh_h + lh_b + lh_w;
+        let lh_c = lh_commit / r;
+        let lh_tot = lh_h + lh_c;
         let mpt_i = mpt_insert / r;
         let mpt_r = mpt_root / r;
-        let mpt_w = mpt_write / r;
-        let mpt_tot = mpt_i + mpt_r + mpt_w;
+        let mpt_c = mpt_commit / r;
+        let mpt_tot = mpt_i + mpt_r + mpt_c;
 
         println!(
-            "║  {:<6}  {:<10} {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
+            "║  {:<6}  {:<10} {:<10} {:<10} {:<7}    {:<10} {:<10} {:<10} {:<10} {:<7}  ║",
             label,
-            fmt_dur(lh_h), fmt_dur(lh_b), fmt_dur(lh_w), fmt_dur(lh_tot), fmt_tps(n, lh_tot),
-            fmt_dur(mpt_i), fmt_dur(mpt_r), fmt_dur(mpt_w), fmt_dur(mpt_tot), fmt_tps(n, mpt_tot),
+            fmt_dur(lh_h), fmt_dur(lh_c), fmt_dur(lh_tot), fmt_tps(n, lh_tot),
+            fmt_dur(mpt_i), fmt_dur(mpt_r), fmt_dur(mpt_c), fmt_dur(mpt_tot), fmt_tps(n, mpt_tot),
         );
     }
 

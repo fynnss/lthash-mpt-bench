@@ -90,15 +90,14 @@ impl StateDb {
         Ok(())
     }
 
-    /// Like [`apply_parallel`] but returns `(hash_dur, build_dur, write_dur)`.
+    /// Like [`apply_parallel`] but returns `(hash_dur, commit_dur)`.
     ///
-    /// * `hash_dur`  — parallel BLAKE3 XOF delta computation
-    /// * `build_dur` — encode accounts + assemble `WriteBatch` in memory
-    /// * `write_dur` — `db.write(batch)` — actual RocksDB WAL / memtable write
+    /// * `hash_dur`   — parallel BLAKE3 XOF delta computation
+    /// * `commit_dur` — encode accounts + assemble WriteBatch + `db.write`
     pub fn apply_parallel_timed(
         &mut self,
         changes: &[StateChange],
-    ) -> Result<(std::time::Duration, std::time::Duration, std::time::Duration)> {
+    ) -> Result<(std::time::Duration, std::time::Duration)> {
         use std::time::Instant;
 
         let t0 = Instant::now();
@@ -106,14 +105,10 @@ impl StateDb {
         let hash_dur = t0.elapsed();
 
         let t1 = Instant::now();
-        let batch = self.build_batch(changes);
-        let build_dur = t1.elapsed();
+        self.flush_changes(changes)?;
+        let commit_dur = t1.elapsed();
 
-        let t2 = Instant::now();
-        self.db.write(batch)?;
-        let write_dur = t2.elapsed();
-
-        Ok((hash_dur, build_dur, write_dur))
+        Ok((hash_dur, commit_dur))
     }
 
     /// Write all KV changes + updated world hash to RocksDB in one batch.
